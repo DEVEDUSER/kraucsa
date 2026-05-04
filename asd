@@ -149,6 +149,7 @@ local autoRushWorld = 108
 local autoAttackDelay = 0.05
 local autoSellDelay = 5
 local merchantDelay = 1
+local autoCrateDelay = 1
 
 local selectedDungeonWorld = "Auto"
 local selectedDungeonDifficulty = "Easy"
@@ -172,6 +173,15 @@ local selectedWheelId = "Auto Detect"
 local lastWheelTick = 0
 
 local saveName = "Save1"
+
+local autoCrates = {
+    Easter2024Crate = false,
+    MaterialCrate = false,
+    BasicPerkCrate = false,
+    BoxPerkCrate = false,
+    DungeonCrateWorld3 = false,
+    DungeonCrateWorld1 = false,
+}
 
 local camConn
 local tpConn
@@ -1073,8 +1083,10 @@ local function saveConfig()
 
     local data = {
         State = State,
+        autoCrates = autoCrates,
         sellRarities = sellRarities,
         crateAmount = crateAmount,
+        autoCrateDelay = autoCrateDelay,
         autoRushWorld = autoRushWorld,
         autoAttackDelay = autoAttackDelay,
         autoSellDelay = autoSellDelay,
@@ -1119,8 +1131,14 @@ local function loadConfig()
     end
 
     for k, v in pairs(data.State or {}) do State[k] = v end
+    if type(data.autoCrates) == "table" then
+        for crateId, enabled in pairs(data.autoCrates) do
+            autoCrates[crateId] = enabled == true
+        end
+    end
     if data.sellRarities then sellRarities = data.sellRarities end
     crateAmount = data.crateAmount or crateAmount
+    autoCrateDelay = data.autoCrateDelay or autoCrateDelay
     autoRushWorld = data.autoRushWorld or autoRushWorld
     autoAttackDelay = data.autoAttackDelay or autoAttackDelay
     autoSellDelay = data.autoSellDelay or autoSellDelay
@@ -1248,15 +1266,45 @@ RewardsTab:CreateToggle({ Name = I.quest .. " ClaimDamegeQuest", CurrentValue = 
 
 CratesTab:CreateSection(I.box .. " Crates")
 CratesTab:CreateInput({ Name = I.box .. " Quantidade", PlaceholderText = "Ex: 10", RemoveTextAfterFocusLost = false, Callback = function(text) local n = tonumber(text) crateAmount = n and n > 0 and n or 1 end })
-local function crateButton(name, crateId)
-    CratesTab:CreateButton({ Name = name, Callback = function() openCrateAndTrack(crateId, crateAmount) end })
+CratesTab:CreateInput({
+    Name = I.clock .. " Delay Auto Crates",
+    PlaceholderText = "Padrao: 1",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text)
+        local n = tonumber(text)
+        if n and n >= 0.2 then autoCrateDelay = n end
+    end,
+})
+
+local function crateToggle(name, crateId)
+    CratesTab:CreateToggle({
+        Name = name,
+        CurrentValue = autoCrates[crateId] == true,
+        Flag = "AutoOpen" .. crateId,
+        Callback = function(v)
+            autoCrates[crateId] = v
+        end,
+    })
 end
-crateButton(I.egg .. " EasterCrate", "Easter2024Crate")
-crateButton(I.gift .. " MaterialCrate", "MaterialCrate")
-crateButton(I.star .. " BasicPerk", "BasicPerkCrate")
-crateButton(I.box .. " BoxPerk", "BoxPerkCrate")
-crateButton(I.box .. " Alien DungeonCrateWorld3", "DungeonCrateWorld3")
-crateButton(I.box .. " CrystalCave DungeonCrateWorld1", "DungeonCrateWorld1")
+
+crateToggle(I.egg .. " Auto EasterCrate", "Easter2024Crate")
+crateToggle(I.gift .. " Auto MaterialCrate", "MaterialCrate")
+crateToggle(I.star .. " Auto BasicPerk", "BasicPerkCrate")
+crateToggle(I.box .. " Auto BoxPerk", "BoxPerkCrate")
+crateToggle(I.box .. " Auto Alien DungeonCrateWorld3", "DungeonCrateWorld3")
+crateToggle(I.box .. " Auto CrystalCave DungeonCrateWorld1", "DungeonCrateWorld1")
+
+CratesTab:CreateButton({
+    Name = I.bolt .. " Abrir Selecionadas Agora",
+    Callback = function()
+        for crateId, enabled in pairs(autoCrates) do
+            if enabled then
+                openCrateAndTrack(crateId, crateAmount)
+                task.wait(0.15)
+            end
+        end
+    end,
+})
 
 AutoSellTab:CreateSection(I.shield .. " Protecao")
 AutoSellTab:CreateToggle({ Name = I.boom .. " Favoritar EggRain/BombRain", CurrentValue = true, Flag = "AutoFavoriteRareDrops", Callback = function(v) autoFavoriteRareDrops = v end })
@@ -1413,6 +1461,17 @@ task.spawn(function()
         if State.autoSellHats then pcall(function() sellInventoryCategory("Hats") end) end
         if State.autoSellPets then pcall(function() sellInventoryCategory("Pets") end) end
         if State.autoSellPerks then pcall(function() sellInventoryCategory("Perks") end) end
+    end
+end)
+
+task.spawn(function()
+    while task.wait(autoCrateDelay) do
+        for crateId, enabled in pairs(autoCrates) do
+            if enabled then
+                openCrateAndTrack(crateId, crateAmount)
+                task.wait(0.15)
+            end
+        end
     end
 end)
 
