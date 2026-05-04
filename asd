@@ -129,6 +129,7 @@ local State = {
     autoWheel = false,
     webhookEnabled = false,
     autoDungeon = false,
+    autoClaimDungeonResults = true,
 
     autoEasterCrate = false,
     autoBasicPerkCrate = false,
@@ -213,6 +214,7 @@ local Stats = {
     merchantBought = 0,
     merchantByName = {},
     eggsCollected = 0,
+    dungeonsCompleted = 0,
 }
 
 local sellRarities = {
@@ -858,6 +860,20 @@ local function skipDungeonQueue()
     end)
 end
 
+local function claimDungeonResults()
+    pcall(function()
+        if StateUtil and StateUtil.ClosePage then
+            StateUtil.ClosePage("DungeonResult")
+        end
+    end)
+
+    pcall(function()
+        if StateUtil and StateUtil.ClosePage then
+            StateUtil.ClosePage()
+        end
+    end)
+end
+
 local function dungeonMoveAssist()
     local box = getNearestBox()
 
@@ -1022,6 +1038,7 @@ local function buildWebhookReport()
     table.insert(lines, "BombRain: " .. tostring(Stats.bombRainGained))
     table.insert(lines, "Tickets: " .. tostring(Stats.ticketsGained))
     table.insert(lines, "Ovos EggHunt: " .. tostring(Stats.eggsCollected))
+    table.insert(lines, "Dungeons completas: " .. tostring(Stats.dungeonsCompleted))
     table.insert(lines, "Merchant buys: " .. tostring(Stats.merchantBought))
     table.insert(lines, "Vendidos: " .. tostring(Stats.itemsSold))
     table.insert(lines, "Hats: " .. tostring(Stats.hatsSold) .. " | Pets: " .. tostring(Stats.petsSold) .. " | Perks: " .. tostring(Stats.perksSold))
@@ -1132,6 +1149,28 @@ pcall(function()
             count = math.floor(buffer.len(boxBuffer) / 2)
         end)
         Stats.boxesBroken = Stats.boxesBroken + count
+    end)
+end)
+
+pcall(function()
+    RE.DungeonResults.OnClientEvent:Connect(function(result)
+        Stats.dungeonsCompleted = Stats.dungeonsCompleted + 1
+        dungeonVisitedDoors = {}
+        dungeonNoBoxSince = nil
+
+        pcall(function()
+            if result and result.Slots then
+                for _, slot in pairs(result.Slots) do
+                    trackCrateReward(slot)
+                end
+            end
+        end)
+
+        if State.autoDungeon and State.autoClaimDungeonResults then
+            task.delay(2.5, function()
+                claimDungeonResults()
+            end)
+        end
     end)
 end)
 
@@ -1285,8 +1324,10 @@ DungeonTab:CreateSection(I.map .. " Auto Dungeon")
 DungeonTab:CreateDropdown({ Name = I.globe .. " Mundo da Dungeon", Options = { "Auto", "World1", "World2", "World3", "World4", "World5", "World6", "World7", "World8", "World9", "World10", "Event" }, CurrentOption = { "Auto" }, MultipleOptions = false, Flag = "DungeonWorld", Callback = function(opt) selectedDungeonWorld = opt[1] end })
 DungeonTab:CreateDropdown({ Name = I.fire .. " Dificuldade", Options = { "Easy", "Medium", "Hard" }, CurrentOption = { "Easy" }, MultipleOptions = false, Flag = "DungeonDifficulty", Callback = function(opt) selectedDungeonDifficulty = opt[1] end })
 DungeonTab:CreateToggle({ Name = I.sword .. " Auto Dungeon", CurrentValue = false, Flag = "AutoDungeon", Callback = function(v) State.autoDungeon = v if v then State.autoAttackBoxes = true end end })
+DungeonTab:CreateToggle({ Name = I.gift .. " Auto Claim Dungeon Results", CurrentValue = true, Flag = "AutoClaimDungeonResults", Callback = function(v) State.autoClaimDungeonResults = v end })
 DungeonTab:CreateButton({ Name = I.door .. " Entrar Dungeon Agora", Callback = joinDungeonQueue })
 DungeonTab:CreateButton({ Name = I.fast .. " Skip Queue Agora", Callback = skipDungeonQueue })
+DungeonTab:CreateButton({ Name = I.gift .. " Claim Results Agora", Callback = claimDungeonResults })
 
 WheelTab:CreateSection(I.wheel .. " Wheel")
 WheelTab:CreateDropdown({ Name = I.wheel .. " Wheel", Options = { "Auto Detect", "Easter", "Default" }, CurrentOption = { "Auto Detect" }, MultipleOptions = false, Flag = "SelectedWheel", Callback = function(opt) selectedWheelId = opt[1] end })
