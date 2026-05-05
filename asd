@@ -38,12 +38,17 @@ end
 local ModulesFolder = ReplicatedStorage:FindFirstChild("Modules")
 local SharedFolder = ReplicatedStorage:FindFirstChild("Shared")
 local ControllersFolder = ReplicatedStorage:FindFirstChild("Controllers")
+local SharedUtilFolder = SharedFolder and SharedFolder:FindFirstChild("Util")
 
 local PlayerData = safeRequire(ModulesFolder and ModulesFolder:FindFirstChild("PlayerData"))
 local ItemData = safeRequire(SharedFolder and SharedFolder:FindFirstChild("ItemData"))
 local Clock = safeRequire(SharedFolder and SharedFolder:FindFirstChild("Clock"))
 local StateUtil = safeRequire(SharedFolder and SharedFolder:FindFirstChild("StateUtil"))
 local StatsModule = safeRequire(SharedFolder and SharedFolder:FindFirstChild("StatsModule"))
+local AreaData = safeRequire(SharedFolder and SharedFolder:FindFirstChild("AreaData"))
+local GameConfig = safeRequire(SharedFolder and SharedFolder:FindFirstChild("GameConfig"))
+local UniverseData = safeRequire(SharedFolder and SharedFolder:FindFirstChild("UniverseData"))
+local BattlePassUtil = safeRequire(SharedUtilFolder and SharedUtilFolder:FindFirstChild("BattlePassUtil"))
 local BoxController = safeRequire(ControllersFolder and ControllersFolder:FindFirstChild("BoxController"))
 
 local EggHuntData
@@ -118,6 +123,7 @@ local State = {
     autoAch = false,
     autoPerk = false,
     autoClaimDamageQuest = false,
+    autoBoxPassClaimAll = false,
 
     camLock = false,
     tpCamera = false,
@@ -130,6 +136,11 @@ local State = {
     webhookEnabled = false,
     autoDungeon = false,
     autoClaimDungeonResults = true,
+    autoDungeonTeamSwap = true,
+    noGiantGiftPillars = true,
+    autoCollectTreasure = false,
+    autoClaimChest = false,
+    autoFarmIndex = false,
 
     autoEasterCrate = false,
     autoBasicPerkCrate = false,
@@ -156,8 +167,20 @@ local selectedDungeonDifficulty = "Easy"
 local autoDungeonDelay = 2
 local lastDungeonAction = 0
 local lastDungeonAdvanceAt = 0
+local lastDungeonJoinAt = 0
 local dungeonNoBoxSince = nil
 local dungeonVisitedDoors = {}
+local dungeonRoomPerkTeam = 1
+local dungeonBossPerkTeam = 2
+local dungeonCurrentPerkTeamMode = nil
+local dungeonBossLocked = false
+local lastDungeonTeamSwapAt = 0
+local currentDungeonId = nil
+local dungeonLastAdvanceDirection = nil
+local dungeonLastTargetPos = nil
+local dungeonRoomLockUntil = 0
+local dungeonFirstTeleportAt = 0
+local lastGiantGiftPillarCleanupAt = 0
 
 local webhookUrl = ""
 local webhookDelayMinutes = 60
@@ -198,14 +221,23 @@ local farmAreaIndex = 1
 local farmAreaRadius = 90
 local farmAreaStep = 28
 local farmAreaCenter
+local farmAreaSize
 local farmPoints = {}
 local farmPointIndex = 1
+local farmAreaLastRescue = 0
+
+local autoFarmIndexMaxArea = 0
+local autoFarmIndexCheckDelay = 8
+local lastAutoFarmIndexCheck = 0
+local currentAutoFarmIndexArea = nil
 
 local lastGoldRushAt = 0
 local lastEasterRushAt = 0
 local lastCloseAt = 0
 local lastRewardAt = 0
 local lastPerkAt = 0
+local lastTreasureAt = 0
+local lastChestAt = 0
 
 local Stats = {
     startedAt = os.clock(),
@@ -224,7 +256,11 @@ local Stats = {
     merchantBought = 0,
     merchantByName = {},
     eggsCollected = 0,
+    treasuresCollected = 0,
+    chestsClaimed = 0,
     dungeonsCompleted = 0,
+    indexTargetArea = 0,
+    indexMissingHats = 0,
 }
 
 local sellRarities = {
@@ -541,36 +577,280 @@ local function stopTPCameraRoute()
     if tpConn then tpConn:Disconnect() tpConn = nil end
 end
 
+local function getAreaData(index)
+    if not AreaData or not AreaData.Get then return nil end
+    local ok, data = pcall(function()
+        return AreaData.Get(index)
+    end)
+    return ok and data or nil
+end
+
+local function getAreaIndexFromName(name)
+    local n = tostring(name or ""):match("^(%d+)_")
+    if not n then n = tostring(name or ""):match("^(%d+)") end
+    return n and tonumber(n) or nil
+end
+
+local function getAreaIndexFromModel(area)
+    if not area then return nil end
+
+    local attr = area:GetAttribute("Index")
+    if type(attr) == "number" then return math.floor(attr) end
+
+    return getAreaIndexFromName(area.Name)
+end
+
 local function getAreaModel(index)
     local areas = workspace:FindFirstChild("Areas")
     if not areas then return nil end
 
-    local prefix = tostring(index) .. "_"
+    local wanted = tonumber(index)
+    if not wanted then return nil end
+    local data = wanted and getAreaData(wanted)
+    local dataName = data and data.Name and tostring(data.Name):lower():gsub("%s+", "") or nil
+
     for _, area in ipairs(areas:GetChildren()) do
-        if tostring(area.Name):sub(1, #prefix) == prefix then return area end
-        if area:GetAttribute("Index") == index then return area end
+        if getAreaIndexFromModel(area) == wanted then return area end
+    end
+
+    if dataName then
+        for _, area in ipairs(areas:GetChildren()) do
+            local areaName = tostring(area.Name):lower():gsub("%s+", "")
+            if areaName:find(dataName, 1, true) then return area end
+        end
     end
 
     return areas:FindFirstChild(tostring(index))
 end
 
+local function isAreaLoadedInCurrentWorld(index)
+    local areas = workspace:FindFirstChild("Areas")
+    local wanted = tonumber(index)
+    if not areas or not wanted then return false end
+
+    local hasIndexedAreas = false
+
+    for _, area in ipairs(areas:GetChildren()) do
+        local areaIndex = getAreaIndexFromModel(area)
+        if areaIndex then
+            hasIndexedAreas = true
+            if areaIndex == wanted then
+                return true
+            end
+        end
+    end
+
+    if hasIndexedAreas then
+        return false
+    end
+
+    return getAreaModel(wanted) ~= nil
+end
+
+local function getInstancePathText(inst, limit)
+    local names = {}
+    local current = inst
+
+    while current and current ~= workspace and #names < (limit or 6) do
+        table.insert(names, tostring(current.Name or ""))
+        current = current.Parent
+    end
+
+    return table.concat(names, " "):lower()
+end
+
+local function partLooksLikeEggArea(part)
+    local text = getInstancePathText(part)
+    return text:find("egg", 1, true)
+        or text:find("capsule", 1, true)
+        or text:find("hatch", 1, true)
+        or text:find("pet", 1, true)
+end
+
+local function partLooksLikeBoxField(part)
+    if not part or not part:IsA("BasePart") or partLooksLikeEggArea(part) then return false end
+
+    local text = getInstancePathText(part)
+    local name = part.Name:lower()
+
+    return text:find("boxfield", 1, true)
+        or text:find("box field", 1, true)
+        or text:find("boxzone", 1, true)
+        or text:find("box zone", 1, true)
+        or text:find("attackzone", 1, true)
+        or text:find("attack zone", 1, true)
+        or name == "field"
+        or (text:find("box", 1, true) and (
+            text:find("field", 1, true)
+            or text:find("zone", 1, true)
+            or text:find("spawn", 1, true)
+            or text:find("hitbox", 1, true)
+        ))
+end
+
+local function partLooksUsefulForFarm(part)
+    if not part or not part:IsA("BasePart") then return false end
+    if partLooksLikeEggArea(part) then return false end
+    if partLooksLikeBoxField(part) then return true end
+
+    local n = part.Name:lower()
+    local p = part.Parent and part.Parent.Name:lower() or ""
+
+    return n:find("hitbox", 1, true)
+        or n:find("field", 1, true)
+        or n:find("floor", 1, true)
+        or n:find("ground", 1, true)
+        or p:find("hitbox", 1, true)
+        or p:find("field", 1, true)
+        or p:find("floor", 1, true)
+        or p:find("ground", 1, true)
+end
+
+local function boundsFromParts(parts)
+    local minX, minY, minZ
+    local maxX, maxY, maxZ
+
+    for _, part in ipairs(parts) do
+        local p = part.Position
+        local s = part.Size or Vector3.new(0, 0, 0)
+        local half = s / 2
+
+        local x1, y1, z1 = p.X - half.X, p.Y - half.Y, p.Z - half.Z
+        local x2, y2, z2 = p.X + half.X, p.Y + half.Y, p.Z + half.Z
+
+        minX = minX and math.min(minX, x1) or x1
+        minY = minY and math.min(minY, y1) or y1
+        minZ = minZ and math.min(minZ, z1) or z1
+        maxX = maxX and math.max(maxX, x2) or x2
+        maxY = maxY and math.max(maxY, y2) or y2
+        maxZ = maxZ and math.max(maxZ, z2) or z2
+    end
+
+    if not minX then return nil end
+
+    local center = Vector3.new((minX + maxX) / 2, minY + 6, (minZ + maxZ) / 2)
+    local size = Vector3.new(maxX - minX, maxY - minY, maxZ - minZ)
+    return center, size
+end
+
+local function centerFromParts(parts)
+    local center = boundsFromParts(parts)
+    return center
+end
+
+local function getAreaBoxFieldInfo(area)
+    if not area then return nil, nil end
+
+    local areaIndex = getAreaIndexFromModel(area)
+    local areaData = areaIndex and getAreaData(areaIndex)
+
+    if BoxController and BoxController.GetField then
+        local ids = {
+            areaData and areaData.Id,
+            areaData and areaData.FieldId,
+            areaData and areaData.BoxFieldId,
+            areaData and areaData.Name,
+            area and area.Name,
+            areaIndex and tostring(areaIndex),
+        }
+
+        local seen = {}
+        for _, id in ipairs(ids) do
+            if id and not seen[id] then
+                seen[id] = true
+
+                local ok, field = pcall(function()
+                    return BoxController.GetField(id)
+                end)
+
+                if ok and field and field.Position and field.Size then
+                    return field.Position, field.Size
+                end
+            end
+        end
+    end
+
+    local fieldParts = {}
+    for _, inst in ipairs(area:GetDescendants()) do
+        if partLooksLikeBoxField(inst) then
+            table.insert(fieldParts, inst)
+        end
+    end
+
+    return boundsFromParts(fieldParts)
+end
+
 local function getModelCenter(model)
     if not model then return nil end
 
-    local ok, cf = pcall(function()
-        return model:GetPivot()
-    end)
-    if ok and cf then return cf.Position end
+    if model:IsA("BasePart") then return model.Position end
+
+    local fieldCenter = getAreaBoxFieldInfo(model)
+    if fieldCenter then return fieldCenter end
+
+    local areaIndex = getAreaIndexFromModel(model)
+    local areaData = areaIndex and getAreaData(areaIndex)
+    if BoxController and BoxController.GetField and areaData and areaData.Id then
+        local ok, field = pcall(function()
+            return BoxController.GetField(areaData.Id)
+        end)
+        if ok and field and field.Position then return field.Position end
+    end
+
+    local useful = {}
+    local fallback = {}
+
+    for _, inst in ipairs(model:GetDescendants()) do
+        if inst:IsA("BasePart") then
+            if partLooksUsefulForFarm(inst) then
+                table.insert(useful, inst)
+            else
+                table.insert(fallback, inst)
+            end
+        end
+    end
+
+    local usefulCenter = centerFromParts(useful)
+    if usefulCenter then return usefulCenter end
+
+    if model:IsA("Model") then
+        local ok, cf = pcall(function()
+            return model:GetPivot()
+        end)
+        if ok and cf then return cf.Position end
+    end
+
+    local fallbackCenter = centerFromParts(fallback)
+    if fallbackCenter then return fallbackCenter end
 
     local part = model:FindFirstChildWhichIsA("BasePart", true)
     return part and part.Position or nil
+end
+
+local function refreshFarmRoute()
+    if not farmAreaCenter then return end
+
+    local radius = farmAreaRadius
+    if farmAreaSize then
+        local fieldRadius = math.min(farmAreaSize.X, farmAreaSize.Z) / 2 - 8
+        if fieldRadius > 12 then
+            radius = math.min(radius, fieldRadius)
+        end
+    end
+
+    farmPoints = buildRoutePoints(farmAreaCenter, radius, farmAreaStep)
+    farmPointIndex = 1
 end
 
 local function startFarmAreaRoute()
     if areaConn then areaConn:Disconnect() areaConn = nil end
 
     local area = getAreaModel(farmAreaIndex)
-    farmAreaCenter = getModelCenter(area)
+    farmAreaCenter, farmAreaSize = getAreaBoxFieldInfo(area)
+    if not farmAreaCenter then
+        farmAreaCenter = getModelCenter(area)
+        farmAreaSize = nil
+    end
 
     if not farmAreaCenter then
         notify(I.warn .. " Area Farm", "Area nao encontrada: " .. tostring(farmAreaIndex), 3)
@@ -581,8 +861,7 @@ local function startFarmAreaRoute()
     local root = char:WaitForChild("HumanoidRootPart")
     root.CFrame = CFrame.new(farmAreaCenter + Vector3.new(0, 4, 0))
 
-    farmPoints = buildRoutePoints(farmAreaCenter, farmAreaRadius, farmAreaStep)
-    farmPointIndex = 1
+    refreshFarmRoute()
     State.autoAttackBoxes = true
 
     areaConn = RunService.Heartbeat:Connect(function()
@@ -604,13 +883,177 @@ local function startFarmAreaRoute()
         end
 
         h:MoveTo(target)
+
+        local flatCenter = Vector3.new(farmAreaCenter.X, r.Position.Y, farmAreaCenter.Z)
+        if (r.Position - flatCenter).Magnitude > farmAreaRadius + 80 and os.clock() - farmAreaLastRescue >= 5 then
+            farmAreaLastRescue = os.clock()
+            r.CFrame = CFrame.new(farmAreaCenter + Vector3.new(0, 4, 0))
+        end
     end)
 
-    notify(I.map .. " Area Farm", "Farmando area " .. tostring(farmAreaIndex), 3)
+    local label = area and area.Name or tostring(farmAreaIndex)
+    notify(I.map .. " Area Farm", "Farmando area " .. tostring(farmAreaIndex) .. " - " .. label, 3)
+end
+
+local function stopCharacterWalk()
+    local c = player.Character
+    local r = c and c:FindFirstChild("HumanoidRootPart")
+    local h = c and c:FindFirstChildOfClass("Humanoid")
+
+    if h then
+        h:Move(Vector3.new(0, 0, 0), true)
+        if r then
+            h:MoveTo(r.Position)
+        end
+    end
 end
 
 local function stopFarmAreaRoute()
     if areaConn then areaConn:Disconnect() areaConn = nil end
+    farmPoints = {}
+    farmPointIndex = 1
+    farmAreaLastRescue = 0
+    stopCharacterWalk()
+end
+
+local function getReleasedAreaCount()
+    if AreaData and AreaData.ReleasedAreaCount then
+        local ok, count = pcall(function()
+            return AreaData.ReleasedAreaCount()
+        end)
+        if ok and type(count) == "number" then return count end
+    end
+
+    if AreaData and type(AreaData.Index) == "table" then
+        return #AreaData.Index
+    end
+
+    return 0
+end
+
+local function getUnlockedAreaCount()
+    local data = PlayerData and PlayerData.data
+    local unlocked = data and tonumber(data.AreasUnlocked)
+    if unlocked and unlocked > 0 then return unlocked end
+    return getReleasedAreaCount()
+end
+
+local function isDiscoveredItem(item)
+    local data = PlayerData and PlayerData.data
+    local tasks = data and data.GlobalTasks
+    if not tasks or not item then return false end
+
+    local discoveryId = item.DiscoveryId or (item.Id and ("Item" .. tostring(item.Id)))
+    return discoveryId and (tasks[discoveryId] or 0) > 0
+end
+
+local function isHatIndexItem(item)
+    if not item or not item.Id then return false end
+    if item.Type == "Hat" then return true end
+
+    local itemData = nil
+    if ItemData and ItemData.Get then
+        local ok, result = pcall(function()
+            return ItemData.Get(item.Id)
+        end)
+        if ok then itemData = result end
+    end
+
+    return itemData and itemData.Type == "Hat"
+end
+
+local function getAreaIndexInfo(index)
+    local data = getAreaData(index)
+    local collection = data and data.Collection
+    local items = collection and collection.Items
+    if type(items) ~= "table" then return nil end
+
+    local total = 0
+    local found = 0
+    local missing = {}
+
+    for _, item in ipairs(items) do
+        if isHatIndexItem(item) then
+            total = total + 1
+            if isDiscoveredItem(item) then
+                found = found + 1
+            else
+                table.insert(missing, item.Id)
+            end
+        end
+    end
+
+    return {
+        Index = index,
+        Name = data.Name or tostring(index),
+        Total = total,
+        Found = found,
+        Missing = total - found,
+        MissingItems = missing,
+    }
+end
+
+local function findNextIncompleteIndexArea()
+    local maxArea = tonumber(autoFarmIndexMaxArea) or 0
+    if maxArea <= 0 then maxArea = getUnlockedAreaCount() end
+
+    local released = getReleasedAreaCount()
+    if released > 0 then maxArea = math.min(maxArea, released) end
+
+    for i = 1, maxArea do
+        if isAreaLoadedInCurrentWorld(i) then
+            local info = getAreaIndexInfo(i)
+            if info and info.Total > 0 and info.Missing > 0 then
+                return info
+            end
+        end
+    end
+
+    return nil
+end
+
+local function startAutoIndexTarget(info)
+    if not info then return end
+
+    Stats.indexTargetArea = info.Index
+    Stats.indexMissingHats = info.Missing
+    farmAreaIndex = info.Index
+    autoFarmArea = true
+    State.autoAttackBoxes = true
+    currentAutoFarmIndexArea = info.Index
+    startFarmAreaRoute()
+
+    notify(
+        I.map .. " Auto Index",
+        "Area " .. tostring(info.Index) .. " - " .. tostring(info.Name) .. " | faltam " .. tostring(info.Missing) .. "/" .. tostring(info.Total),
+        5
+    )
+end
+
+local function checkAutoFarmIndex()
+    if not AreaData then
+        notify(I.warn .. " Auto Index", "AreaData nao encontrado.", 4)
+        return
+    end
+
+    local info = findNextIncompleteIndexArea()
+    if info then
+        if currentAutoFarmIndexArea ~= info.Index or not autoFarmArea then
+            startAutoIndexTarget(info)
+        else
+            Stats.indexMissingHats = info.Missing
+        end
+    else
+        Stats.indexTargetArea = 0
+        Stats.indexMissingHats = 0
+        State.autoFarmIndex = false
+        if currentAutoFarmIndexArea then
+            autoFarmArea = false
+            stopFarmAreaRoute()
+        end
+        currentAutoFarmIndexArea = nil
+        notify(I.check .. " Auto Index", "Todas as areas verificadas estao completas.", 5)
+    end
 end
 
 local function getEquippedPerkIds()
@@ -740,6 +1183,65 @@ local function claimDamageQuest()
     end)
 end
 
+local function getBattlePassStage(battlePass)
+    local experience = battlePass and battlePass.Experience or 0
+
+    if BattlePassUtil and BattlePassUtil.GetBattlePassStage then
+        local ok, stage = pcall(function()
+            return BattlePassUtil.GetBattlePassStage(experience)
+        end)
+        if ok and stage then return stage end
+    end
+
+    local config = GameConfig and GameConfig.BattlePass
+    local stageXp = config and config.StageXP or 1
+    local maxStage = config and config.MaxStage or 100
+    return math.min(math.floor(experience / stageXp), maxStage)
+end
+
+local function claimAllBoxPassRewards(silent)
+    local data = PlayerData and PlayerData.data
+    local battlePass = data and data.BattlePass
+    local remote = RF:FindFirstChild("ClaimBattlePass")
+
+    if not battlePass or not remote then
+        if not silent then notify(I.warn .. " Box Pass", "BattlePass ou ClaimBattlePass nao encontrado.", 3) end
+        return
+    end
+
+    local maxStage = getBattlePassStage(battlePass)
+    local tiers = battlePass.Tiers or {}
+    local tierList = { "Free" }
+
+    if battlePass.IsPremium or player.MembershipType == Enum.MembershipType.Premium then
+        table.insert(tierList, "Premium")
+    end
+
+    if battlePass.IsPaid then
+        table.insert(tierList, "Paid")
+    end
+
+    local claimed = 0
+    for stage = 1, maxStage do
+        for _, tier in ipairs(tierList) do
+            local tierData = tiers[tier] or {}
+            local key = ("Stage_%s"):format(stage)
+
+            if not tierData[key] then
+                pcall(function()
+                    remote:InvokeServer(tier, stage)
+                end)
+                claimed = claimed + 1
+                task.wait(0.04)
+            end
+        end
+    end
+
+    if not silent then
+        notify(I.gift .. " Box Pass", "Tentou coletar " .. tostring(claimed) .. " rewards.", 3)
+    end
+end
+
 local function collectAllEggHuntEggs()
     local char = player.Character or player.CharacterAdded:Wait()
     local root = char:FindFirstChild("HumanoidRootPart")
@@ -801,6 +1303,158 @@ local function claimEggHuntMilestones()
             RE.ClaimEggHuntMilestone:FireServer(i)
         end)
         task.wait(0.05)
+    end
+end
+
+local function getTaggedPosition(inst)
+    if not inst then return nil end
+
+    if inst:IsA("BasePart") then
+        return inst.Position
+    end
+
+    if inst:IsA("Model") then
+        local ok, pivot = pcall(function()
+            return inst:GetPivot()
+        end)
+        if ok and pivot then return pivot.Position end
+    end
+
+    local part = inst:FindFirstChildWhichIsA("BasePart", true)
+    return part and part.Position or nil
+end
+
+local function isTreasureCollected(uniqueId)
+    local data = PlayerData and PlayerData.data
+    local tasks = data and data.GlobalTasks
+    if not tasks or not uniqueId then return false end
+    return (tasks["Treasure" .. tostring(uniqueId)] or 0) > 0
+end
+
+local function collectAllTreasures()
+    if not RE:FindFirstChild("CollectTreasure") then
+        notify(I.warn .. " Treasure", "Remote CollectTreasure nao encontrado.", 3)
+        return
+    end
+
+    local char = player.Character or player.CharacterAdded:Wait()
+    local root = char:FindFirstChild("HumanoidRootPart")
+    local collected = 0
+
+    for _, inst in ipairs(CollectionService:GetTagged("Treasure")) do
+        local uniqueId = inst:GetAttribute("UniqueId")
+
+        if uniqueId and not isTreasureCollected(uniqueId) then
+            pcall(function()
+                local pos = getTaggedPosition(inst)
+                if root and pos then
+                    root.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+                    task.wait(0.12)
+                end
+
+                RE.CollectTreasure:FireServer(uniqueId)
+                collected = collected + 1
+            end)
+            task.wait(0.08)
+        end
+    end
+
+    Stats.treasuresCollected = Stats.treasuresCollected + collected
+    notify(I.gift .. " Treasure", "Tentou coletar " .. tostring(collected) .. " tesouros.", 3)
+end
+
+local function getChestRewardKeys(chestModel)
+    local keys = {}
+    local function add(value)
+        value = tostring(value or "")
+        if value ~= "" then table.insert(keys, value) end
+    end
+
+    local name = chestModel and chestModel.Name or ""
+    local lower = string.lower(name)
+
+    add(name)
+    if not name:match("^Chest") then add("Chest" .. name) end
+
+    if lower:find("coin", 1, true) then
+        local currency
+        pcall(function()
+            local world = UniverseData and UniverseData.Get and UniverseData.Get(UniverseData.ID)
+            currency = world and world.Currency
+        end)
+        add("ChestCoin")
+        if currency then add("Chest" .. tostring(currency)) end
+    end
+
+    if lower:find("gem", 1, true) then add("ChestGem") end
+    if lower:find("vip", 1, true) then add("ChestVip") end
+    if lower:find("misc", 1, true) then add("ChestMisc") end
+    if lower:find("hat", 1, true) or lower:find("unique", 1, true) then add("ChestHat") end
+
+    return keys
+end
+
+local function isChestAvailable(chestModel)
+    local data = PlayerData and PlayerData.data
+    local timed = data and data.TimedRewards
+    if not timed then return true end
+
+    local now = Clock and Clock.now and Clock.now() or os.time()
+    for _, key in ipairs(getChestRewardKeys(chestModel)) do
+        local readyAt = timed[key]
+        if readyAt == nil or readyAt <= now then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function collectAllChests(silent)
+    local remote = RF:FindFirstChild("ClaimTimedReward")
+    if not remote then
+        if not silent then notify(I.warn .. " Chests", "Remote ClaimTimedReward nao encontrado.", 3) end
+        return
+    end
+
+    local char = player.Character or player.CharacterAdded:Wait()
+    local root = char:FindFirstChild("HumanoidRootPart")
+    local tried = {}
+    local claimed = 0
+
+    local function tryChest(chestModel)
+        if not chestModel or tried[chestModel] then return end
+        tried[chestModel] = true
+        if not isChestAvailable(chestModel) then return end
+
+        pcall(function()
+            local hitbox = chestModel:FindFirstChild("ChestHitbox", true)
+            local pos = getTaggedPosition(hitbox or chestModel)
+            if root and pos then
+                root.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+                task.wait(0.12)
+            end
+
+            remote:InvokeServer(chestModel)
+            claimed = claimed + 1
+        end)
+    end
+
+    for _, inst in ipairs(CollectionService:GetTagged("Chest")) do
+        tryChest(inst.Parent)
+        task.wait(0.05)
+    end
+
+    for _, inst in ipairs(workspace:GetDescendants()) do
+        if inst.Name == "ChestHitbox" then
+            tryChest(inst.Parent)
+            task.wait(0.05)
+        end
+    end
+
+    Stats.chestsClaimed = Stats.chestsClaimed + claimed
+    if not silent then
+        notify(I.gift .. " Chests", "Tentou coletar " .. tostring(claimed) .. " baus.", 3)
     end
 end
 
@@ -884,7 +1538,184 @@ local function claimDungeonResults()
     end)
 end
 
+local function equipPerkTeam(teamIndex, mode, silent)
+    teamIndex = tonumber(teamIndex)
+    if not teamIndex or teamIndex < 1 then return false end
+    teamIndex = math.floor(teamIndex)
+
+    local remote = RE:FindFirstChild("EquipTeam")
+    if not remote then
+        if not silent then notify(I.warn .. " Perk Team", "Remote EquipTeam nao encontrado.", 3) end
+        return false
+    end
+
+    local ok = pcall(function()
+        remote:FireServer("Perk", teamIndex)
+    end)
+
+    if ok then
+        dungeonCurrentPerkTeamMode = mode or dungeonCurrentPerkTeamMode
+        if not silent then
+            notify(I.star .. " Perk Team", "Equipe " .. tostring(teamIndex) .. " equipada.", 2)
+        end
+    end
+
+    return ok
+end
+
+local function isBossDungeonBox(box)
+    if not box then return false end
+
+    local texts = {}
+    local function add(value)
+        if value ~= nil then table.insert(texts, string.lower(tostring(value))) end
+    end
+
+    pcall(function() add(box.Id) end)
+    pcall(function() add(box.Name) end)
+    pcall(function() add(box.ModelId) end)
+    pcall(function() add(box.BoxId) end)
+    pcall(function() add(box.Type) end)
+    pcall(function() if box.Model then add(box.Model.Name) end end)
+    pcall(function() if box.Instance then add(box.Instance.Name) end end)
+
+    local text = table.concat(texts, " ")
+    return text:find("boss", 1, true) ~= nil or text:find("colossal", 1, true) ~= nil
+end
+
+local function updateDungeonPerkTeam(forceRooms)
+    if not State.autoDungeonTeamSwap then return end
+    if not forceRooms and os.clock() - lastDungeonTeamSwapAt < 1.25 then return end
+
+    local mode = "Rooms"
+    if forceRooms then
+        dungeonBossLocked = false
+    elseif dungeonBossLocked or isBossDungeonBox(getNearestBox()) then
+        mode = "Boss"
+        dungeonBossLocked = true
+    end
+
+    if dungeonCurrentPerkTeamMode == mode then return end
+
+    lastDungeonTeamSwapAt = os.clock()
+    if mode == "Boss" then
+        equipPerkTeam(dungeonBossPerkTeam, "Boss", false)
+    else
+        equipPerkTeam(dungeonRoomPerkTeam, "Rooms", false)
+    end
+end
+
+local function getCurrentDungeonRoot()
+    local dungeonId = player:GetAttribute("DungeonId")
+    if not dungeonId then return nil end
+
+    local dungeons = workspace:FindFirstChild("Dungeons")
+    local dungeonRoot = dungeons and dungeons:FindFirstChild(tostring(dungeonId))
+    if dungeonRoot then return dungeonRoot end
+
+    return nil
+end
+
+local function getInstanceCFrame(inst)
+    if inst:IsA("BasePart") then
+        return inst.CFrame
+    elseif inst:IsA("Model") then
+        local ok, cf = pcall(function()
+            return inst:GetPivot()
+        end)
+        if ok and cf then return cf end
+    end
+end
+
+local function isInCurrentDungeon(inst)
+    local dungeonId = player:GetAttribute("DungeonId")
+    if not dungeonId then return true end
+
+    local dungeonRoot = getCurrentDungeonRoot()
+    if dungeonRoot then
+        return inst == dungeonRoot or inst:IsDescendantOf(dungeonRoot)
+    end
+
+    local current = inst
+    while current and current ~= workspace do
+        if tostring(current.Name) == tostring(dungeonId) then
+            return true
+        end
+        current = current.Parent
+    end
+
+    return true
+end
+
+local function textHasGiantGift(value)
+    local text = string.lower(tostring(value or ""))
+    return text:find("giant", 1, true) ~= nil and text:find("gift", 1, true) ~= nil
+end
+
+local function isGiantGiftNearby(root, dungeonRoot)
+    local box = getNearestBox()
+    if box then
+        local found = false
+        pcall(function() found = found or textHasGiantGift(box.Id) end)
+        pcall(function() found = found or textHasGiantGift(box.Name) end)
+        pcall(function() found = found or textHasGiantGift(box.ModelId) end)
+        pcall(function() found = found or (box.Model and textHasGiantGift(box.Model.Name)) end)
+        pcall(function() found = found or (box.Instance and textHasGiantGift(box.Instance.Name)) end)
+        if found then return true end
+    end
+
+    for _, inst in ipairs((dungeonRoot or workspace):GetDescendants()) do
+        if textHasGiantGift(inst.Name) then
+            local cf = getInstanceCFrame(inst)
+            if cf and (cf.Position - root.Position).Magnitude <= 260 then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+local function disableGiantGiftPillars()
+    if not State.noGiantGiftPillars then return end
+    if os.clock() - lastGiantGiftPillarCleanupAt < 2 then return end
+    lastGiantGiftPillarCleanupAt = os.clock()
+
+    local char = player.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
+    local dungeonRoot = getCurrentDungeonRoot()
+    if not isGiantGiftNearby(root, dungeonRoot) then return end
+
+    for _, inst in ipairs((dungeonRoot or workspace):GetDescendants()) do
+        if inst:IsA("BasePart") then
+            local fullName = string.lower(inst:GetFullName())
+            local isPillar = fullName:find("pillar", 1, true)
+                or fullName:find("pilar", 1, true)
+                or fullName:find("column", 1, true)
+                or fullName:find("post", 1, true)
+                or fullName:find("cylinder", 1, true)
+                or fullName:find("cilind", 1, true)
+
+            if isPillar and (inst.Position - root.Position).Magnitude <= 280 then
+                pcall(function()
+                    inst.CanCollide = false
+                    inst.CanTouch = false
+                    inst.Transparency = math.max(inst.Transparency, 0.75)
+                end)
+            end
+        end
+    end
+end
+
+local function canDungeonTeleport()
+    return dungeonFirstTeleportAt == 0 or os.clock() >= dungeonFirstTeleportAt
+end
+
 local function dungeonMoveAssist()
+    disableGiantGiftPillars()
+
     local box = getNearestBox()
 
     if box and box.CFrame then
@@ -906,31 +1737,12 @@ local function dungeonMoveAssist()
     end
 
     local function getInstPos(inst)
-        if inst:IsA("BasePart") then
-            return inst.Position, inst.CFrame
-        elseif inst:IsA("Model") then
-            local ok, cf = pcall(function()
-                return inst:GetPivot()
-            end)
-            if ok and cf then
-                return cf.Position, cf
-            end
-        end
+        local cf = getInstanceCFrame(inst)
+        if cf then return cf.Position, cf end
     end
 
     local function isInMyDungeon(inst)
-        local dungeonId = player:GetAttribute("DungeonId")
-        if not dungeonId then return true end
-
-        local current = inst
-        while current and current ~= workspace do
-            if tostring(current.Name) == tostring(dungeonId) then
-                return true
-            end
-            current = current.Parent
-        end
-
-        return true
+        return isInCurrentDungeon(inst)
     end
 
     local nearestDoor
@@ -939,11 +1751,12 @@ local function dungeonMoveAssist()
     local now = os.clock()
 
     for _, inst in ipairs(CollectionService:GetTagged("DungeonDoor")) do
-        if isInMyDungeon(inst) and inst:GetAttribute("Open") ~= false and (not dungeonVisitedDoors[inst] or now - dungeonVisitedDoors[inst] > 18) then
+        if isInMyDungeon(inst) and inst:GetAttribute("Open") ~= false and not dungeonVisitedDoors[inst] then
             local pos, cf = getInstPos(inst)
             if pos then
                 local dist = (pos - root.Position).Magnitude
-                if dist > 10 and dist < nearestDist and dist < 260 then
+                local forwardDot = dungeonLastAdvanceDirection and (pos - root.Position):Dot(dungeonLastAdvanceDirection) or 0
+                if dist > 10 and dist < nearestDist and dist < 260 and forwardDot > -35 then
                     nearestDoor = inst
                     nearestDoorCf = cf
                     nearestDist = dist
@@ -954,11 +1767,12 @@ local function dungeonMoveAssist()
 
     for _, inst in ipairs(workspace:GetDescendants()) do
         local name = string.lower(inst.Name)
-        if (name:find("door") or name:find("portal") or name:find("exit") or name:find("elevator")) and isInMyDungeon(inst) and (not dungeonVisitedDoors[inst] or now - dungeonVisitedDoors[inst] > 18) then
+        if (name:find("door") or name:find("portal") or name:find("exit") or name:find("elevator")) and isInMyDungeon(inst) and not dungeonVisitedDoors[inst] then
             local pos, cf = getInstPos(inst)
             if pos then
                 local dist = (pos - root.Position).Magnitude
-                if dist > 10 and dist < nearestDist and dist < 260 then
+                local forwardDot = dungeonLastAdvanceDirection and (pos - root.Position):Dot(dungeonLastAdvanceDirection) or 0
+                if dist > 10 and dist < nearestDist and dist < 260 and forwardDot > -35 then
                     nearestDoor = inst
                     nearestDoorCf = cf
                     nearestDist = dist
@@ -968,15 +1782,23 @@ local function dungeonMoveAssist()
     end
 
     if nearestDoor and nearestDoorCf then
-        local side = (root.Position - nearestDoorCf.Position):Dot(nearestDoorCf.LookVector)
-        local direction = side >= 0 and -nearestDoorCf.LookVector or nearestDoorCf.LookVector
+        local toDoor = nearestDoorCf.Position - root.Position
+        local direction
+        if toDoor.Magnitude > 1 then
+            direction = toDoor.Unit
+        else
+            direction = dungeonLastAdvanceDirection or nearestDoorCf.LookVector
+        end
         local target = nearestDoorCf.Position + direction * 30 + Vector3.new(0, 3, 0)
 
         humanoid:MoveTo(target)
 
-        if os.clock() - lastDungeonAdvanceAt >= 3 then
+        if canDungeonTeleport() and os.clock() - lastDungeonAdvanceAt >= 3 then
             lastDungeonAdvanceAt = os.clock()
             dungeonVisitedDoors[nearestDoor] = os.clock()
+            dungeonLastAdvanceDirection = direction
+            dungeonLastTargetPos = target
+            dungeonRoomLockUntil = os.clock() + 8
             root.CFrame = CFrame.new(target, target + direction)
         end
 
@@ -990,9 +1812,14 @@ local function dungeonMoveAssist()
         local name = string.lower(inst.Name)
         if inst:IsA("BasePart") and (name:find("floor") or name:find("room") or name:find("path")) and isInMyDungeon(inst) then
             local dist = (inst.Position - root.Position).Magnitude
-            if dist < nearestDist and dist > 25 and dist < 320 then
+            local forwardDot = dungeonLastAdvanceDirection and (inst.Position - root.Position):Dot(dungeonLastAdvanceDirection) or 0
+            local isBehind = dungeonLastAdvanceDirection and forwardDot < -12
+            local lockedNeedsForward = os.clock() < dungeonRoomLockUntil and dungeonLastAdvanceDirection and forwardDot < 6
+            local score = dist - math.max(forwardDot, 0) * 0.25
+
+            if not isBehind and not lockedNeedsForward and score < nearestDist and dist > 25 and dist < 320 then
                 nearestRoomPart = inst
-                nearestDist = dist
+                nearestDist = score
             end
         end
     end
@@ -1001,8 +1828,9 @@ local function dungeonMoveAssist()
         local target = nearestRoomPart.Position + Vector3.new(0, 5, 0)
         humanoid:MoveTo(target)
 
-        if os.clock() - lastDungeonAdvanceAt >= 4 then
+        if canDungeonTeleport() and os.clock() - lastDungeonAdvanceAt >= 4 then
             lastDungeonAdvanceAt = os.clock()
+            dungeonLastTargetPos = target
             root.CFrame = CFrame.new(target)
         end
     end
@@ -1048,7 +1876,12 @@ local function buildWebhookReport()
     table.insert(lines, "BombRain: " .. tostring(Stats.bombRainGained))
     table.insert(lines, "Tickets: " .. tostring(Stats.ticketsGained))
     table.insert(lines, "Ovos EggHunt: " .. tostring(Stats.eggsCollected))
+    table.insert(lines, "Treasures: " .. tostring(Stats.treasuresCollected))
+    table.insert(lines, "Chests: " .. tostring(Stats.chestsClaimed))
     table.insert(lines, "Dungeons completas: " .. tostring(Stats.dungeonsCompleted))
+    if Stats.indexTargetArea and Stats.indexTargetArea > 0 then
+        table.insert(lines, "Auto Index: area " .. tostring(Stats.indexTargetArea) .. " | hats faltando: " .. tostring(Stats.indexMissingHats))
+    end
     table.insert(lines, "Merchant buys: " .. tostring(Stats.merchantBought))
     table.insert(lines, "Vendidos: " .. tostring(Stats.itemsSold))
     table.insert(lines, "Hats: " .. tostring(Stats.hatsSold) .. " | Pets: " .. tostring(Stats.petsSold) .. " | Perks: " .. tostring(Stats.perksSold))
@@ -1102,8 +1935,12 @@ local function saveConfig()
         farmAreaIndex = farmAreaIndex,
         farmAreaRadius = farmAreaRadius,
         farmAreaStep = farmAreaStep,
+        autoFarmIndexMaxArea = autoFarmIndexMaxArea,
+        autoFarmIndexCheckDelay = autoFarmIndexCheckDelay,
         selectedDungeonWorld = selectedDungeonWorld,
         selectedDungeonDifficulty = selectedDungeonDifficulty,
+        dungeonRoomPerkTeam = dungeonRoomPerkTeam,
+        dungeonBossPerkTeam = dungeonBossPerkTeam,
     }
 
     writefile("UnboxingHub/Saves/" .. saveName .. ".json", HttpService:JSONEncode(data))
@@ -1154,8 +1991,12 @@ local function loadConfig()
     farmAreaIndex = data.farmAreaIndex or farmAreaIndex
     farmAreaRadius = data.farmAreaRadius or farmAreaRadius
     farmAreaStep = data.farmAreaStep or farmAreaStep
+    autoFarmIndexMaxArea = data.autoFarmIndexMaxArea or autoFarmIndexMaxArea
+    autoFarmIndexCheckDelay = data.autoFarmIndexCheckDelay or autoFarmIndexCheckDelay
     selectedDungeonWorld = data.selectedDungeonWorld or selectedDungeonWorld
     selectedDungeonDifficulty = data.selectedDungeonDifficulty or selectedDungeonDifficulty
+    dungeonRoomPerkTeam = data.dungeonRoomPerkTeam or dungeonRoomPerkTeam
+    dungeonBossPerkTeam = data.dungeonBossPerkTeam or dungeonBossPerkTeam
 
     notify(I.save .. " Save", "Carregou: " .. saveName, 3)
 end
@@ -1175,6 +2016,13 @@ pcall(function()
         Stats.dungeonsCompleted = Stats.dungeonsCompleted + 1
         dungeonVisitedDoors = {}
         dungeonNoBoxSince = nil
+        currentDungeonId = nil
+        dungeonCurrentPerkTeamMode = nil
+        dungeonBossLocked = false
+        dungeonLastAdvanceDirection = nil
+        dungeonLastTargetPos = nil
+        dungeonRoomLockUntil = 0
+        dungeonFirstTeleportAt = 0
 
         pcall(function()
             if result and result.Slots then
@@ -1230,7 +2078,7 @@ FarmTab:CreateToggle({ Name = I.egg .. " Auto Easter Rush", CurrentValue = false
 FarmTab:CreateToggle({ Name = I.close .. " Auto Close", CurrentValue = false, Flag = "AutoClose", Callback = function(v) State.autoClose = v end })
 FarmTab:CreateToggle({ Name = I.check .. " Auto Close Rush Results", CurrentValue = false, Flag = "AutoCloseRushResults", Callback = function(v) State.autoCloseRushResults = v end })
 FarmTab:CreateToggle({ Name = I.shield .. " NeverGlitch", CurrentValue = false, Flag = "NeverGlitch", Callback = function(v) State.autoPerk = v end })
-FarmTab:CreateButton({ Name = I.boom .. " BOMB RAIN > NOT IS PERK", Callback = function() pcall(function() RE.PromptProductPurchase:FireServer("BombRainInstant") end) end })
+FarmTab:CreateButton({ Name = I.boom .. " BOMB STRIKE", Callback = function() pcall(function() RE.PromptProductPurchase:FireServer("BombRainInstant") end) end })
 
 EventTab:CreateSection(I.party .. " Mole Merchant")
 EventTab:CreateInput({
@@ -1263,6 +2111,13 @@ RewardsTab:CreateToggle({ Name = I.sword .. " Battle Pass", CurrentValue = false
 RewardsTab:CreateToggle({ Name = I.calendar .. " Daily Login", CurrentValue = false, Flag = "DailyLogin", Callback = function(v) State.autoDaily = v end })
 RewardsTab:CreateToggle({ Name = I.medal .. " Achievements", CurrentValue = false, Flag = "Achievements", Callback = function(v) State.autoAch = v end })
 RewardsTab:CreateToggle({ Name = I.quest .. " ClaimDamegeQuest", CurrentValue = false, Flag = "ClaimDamageQuest", Callback = function(v) State.autoClaimDamageQuest = v end })
+RewardsTab:CreateToggle({ Name = I.gift .. " Auto Claim All Box Pass", CurrentValue = false, Flag = "AutoBoxPassClaimAll", Callback = function(v) State.autoBoxPassClaimAll = v end })
+RewardsTab:CreateButton({ Name = I.gift .. " Claim All Box Pass Agora", Callback = function() claimAllBoxPassRewards(false) end })
+RewardsTab:CreateSection(I.gift .. " Treasure & Chests")
+RewardsTab:CreateToggle({ Name = I.gift .. " Auto Collect Treasure", CurrentValue = false, Flag = "AutoCollectTreasure", Callback = function(v) State.autoCollectTreasure = v end })
+RewardsTab:CreateButton({ Name = I.gift .. " Collect All Treasure", Callback = collectAllTreasures })
+RewardsTab:CreateToggle({ Name = I.gift .. " Auto Claim Chest", CurrentValue = false, Flag = "AutoClaimChest", Callback = function(v) State.autoClaimChest = v end })
+RewardsTab:CreateButton({ Name = I.gift .. " Claim All Chests Agora", Callback = function() collectAllChests(false) end })
 
 CratesTab:CreateSection(I.box .. " Crates")
 CratesTab:CreateInput({ Name = I.box .. " Quantidade", PlaceholderText = "Ex: 10", RemoveTextAfterFocusLost = false, Callback = function(text) local n = tonumber(text) crateAmount = n and n > 0 and n or 1 end })
@@ -1342,11 +2197,57 @@ AutoAttackTab:CreateToggle({ Name = I.sword .. " Auto Attack Aura", CurrentValue
 AutoAttackTab:CreateInput({ Name = I.clock .. " Delay", PlaceholderText = "Padrao: 0.05", RemoveTextAfterFocusLost = false, Callback = function(text) local n = tonumber(text) if n and n >= 0.01 then autoAttackDelay = n end end })
 
 AreaFarmTab:CreateSection(I.map .. " Area Farm")
-AreaFarmTab:CreateInput({ Name = I.map .. " Numero da Area", PlaceholderText = "Ex: 1", RemoveTextAfterFocusLost = false, Callback = function(text) local n = tonumber(text) if n then farmAreaIndex = n end end })
-AreaFarmTab:CreateInput({ Name = "Raio", PlaceholderText = "Padrao: 90", RemoveTextAfterFocusLost = false, Callback = function(text) local n = tonumber(text) if n and n >= 20 then farmAreaRadius = n end end })
-AreaFarmTab:CreateInput({ Name = "Espacamento", PlaceholderText = "Padrao: 28", RemoveTextAfterFocusLost = false, Callback = function(text) local n = tonumber(text) if n and n >= 8 then farmAreaStep = n end end })
+AreaFarmTab:CreateInput({ Name = I.map .. " Numero da Area", PlaceholderText = "Ex: 1", RemoveTextAfterFocusLost = false, Callback = function(text) local n = tonumber(text) if n then farmAreaIndex = math.floor(n) if autoFarmArea then startFarmAreaRoute() end end end })
+AreaFarmTab:CreateInput({ Name = "Raio", PlaceholderText = "Padrao: 90", RemoveTextAfterFocusLost = false, Callback = function(text) local n = tonumber(text) if n and n >= 20 then farmAreaRadius = n refreshFarmRoute() end end })
+AreaFarmTab:CreateInput({ Name = "Espacamento", PlaceholderText = "Padrao: 28", RemoveTextAfterFocusLost = false, Callback = function(text) local n = tonumber(text) if n and n >= 8 then farmAreaStep = n refreshFarmRoute() end end })
 AreaFarmTab:CreateToggle({ Name = I.bolt .. " Auto Farm Area + Attack", CurrentValue = false, Flag = "AutoFarmArea", Callback = function(v) autoFarmArea = v if v then startFarmAreaRoute() else stopFarmAreaRoute() end end })
 AreaFarmTab:CreateButton({ Name = I.door .. " Ir para Area", Callback = function() local center = getModelCenter(getAreaModel(farmAreaIndex)) if center then local char = player.Character or player.CharacterAdded:Wait() char:WaitForChild("HumanoidRootPart").CFrame = CFrame.new(center + Vector3.new(0, 4, 0)) end end })
+AreaFarmTab:CreateSection(I.star .. " Auto Farm Index")
+AreaFarmTab:CreateInput({
+    Name = I.map .. " Max Area do Index",
+    PlaceholderText = "0 = areas desbloqueadas",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text)
+        local n = tonumber(text)
+        if n and n >= 0 then autoFarmIndexMaxArea = math.floor(n) end
+    end,
+})
+AreaFarmTab:CreateInput({
+    Name = I.clock .. " Delay Verificar Index",
+    PlaceholderText = "Padrao: 8",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text)
+        local n = tonumber(text)
+        if n and n >= 3 then autoFarmIndexCheckDelay = n end
+    end,
+})
+AreaFarmTab:CreateToggle({
+    Name = I.star .. " Auto Farm Index + Area",
+    CurrentValue = false,
+    Flag = "AutoFarmIndex",
+    Callback = function(v)
+        State.autoFarmIndex = v
+        if v then
+            State.autoAttackBoxes = true
+            checkAutoFarmIndex()
+        else
+            currentAutoFarmIndexArea = nil
+            autoFarmArea = false
+            stopFarmAreaRoute()
+        end
+    end,
+})
+AreaFarmTab:CreateButton({
+    Name = I.star .. " Verificar Index Agora",
+    Callback = function()
+        local info = findNextIncompleteIndexArea()
+        if info then
+            notify(I.star .. " Auto Index", "Proxima: area " .. tostring(info.Index) .. " - " .. tostring(info.Name) .. " | faltam " .. tostring(info.Missing) .. "/" .. tostring(info.Total), 6)
+        else
+            notify(I.check .. " Auto Index", "Nada faltando nas areas verificadas.", 4)
+        end
+    end,
+})
 AreaFarmTab:CreateButton({
     Name = I.warn .. " Debug Area Atual",
     Callback = function()
@@ -1371,11 +2272,18 @@ AreaFarmTab:CreateButton({
 DungeonTab:CreateSection(I.map .. " Auto Dungeon")
 DungeonTab:CreateDropdown({ Name = I.globe .. " Mundo da Dungeon", Options = { "Auto", "World1", "World2", "World3", "World4", "World5", "World6", "World7", "World8", "World9", "World10", "Event" }, CurrentOption = { "Auto" }, MultipleOptions = false, Flag = "DungeonWorld", Callback = function(opt) selectedDungeonWorld = opt[1] end })
 DungeonTab:CreateDropdown({ Name = I.fire .. " Dificuldade", Options = { "Easy", "Medium", "Hard" }, CurrentOption = { "Easy" }, MultipleOptions = false, Flag = "DungeonDifficulty", Callback = function(opt) selectedDungeonDifficulty = opt[1] end })
-DungeonTab:CreateToggle({ Name = I.sword .. " Auto Dungeon", CurrentValue = false, Flag = "AutoDungeon", Callback = function(v) State.autoDungeon = v if v then State.autoAttackBoxes = true end end })
+DungeonTab:CreateToggle({ Name = I.sword .. " Auto Dungeon", CurrentValue = false, Flag = "AutoDungeon", Callback = function(v) State.autoDungeon = v if v then State.autoAttackBoxes = true dungeonCurrentPerkTeamMode = nil updateDungeonPerkTeam(true) end end })
 DungeonTab:CreateToggle({ Name = I.gift .. " Auto Claim Dungeon Results", CurrentValue = true, Flag = "AutoClaimDungeonResults", Callback = function(v) State.autoClaimDungeonResults = v end })
+DungeonTab:CreateToggle({ Name = I.shield .. " No Pillars Giant Gift", CurrentValue = true, Flag = "NoGiantGiftPillars", Callback = function(v) State.noGiantGiftPillars = v end })
 DungeonTab:CreateButton({ Name = I.door .. " Entrar Dungeon Agora", Callback = joinDungeonQueue })
 DungeonTab:CreateButton({ Name = I.fast .. " Skip Queue Agora", Callback = skipDungeonQueue })
 DungeonTab:CreateButton({ Name = I.gift .. " Claim Results Agora", Callback = claimDungeonResults })
+DungeonTab:CreateSection(I.star .. " Perk Teams")
+DungeonTab:CreateToggle({ Name = I.star .. " Auto Swap Rooms/Boss", CurrentValue = true, Flag = "AutoDungeonTeamSwap", Callback = function(v) State.autoDungeonTeamSwap = v end })
+DungeonTab:CreateInput({ Name = I.star .. " Equipe Rooms", PlaceholderText = "Padrao: 1", RemoveTextAfterFocusLost = false, Callback = function(text) local n = tonumber(text) if n and n >= 1 then dungeonRoomPerkTeam = math.floor(n) end end })
+DungeonTab:CreateInput({ Name = I.fire .. " Equipe Boss", PlaceholderText = "Padrao: 2", RemoveTextAfterFocusLost = false, Callback = function(text) local n = tonumber(text) if n and n >= 1 then dungeonBossPerkTeam = math.floor(n) end end })
+DungeonTab:CreateButton({ Name = I.star .. " Equipe 1 Rooms Agora", Callback = function() equipPerkTeam(dungeonRoomPerkTeam, "Rooms", false) end })
+DungeonTab:CreateButton({ Name = I.fire .. " Equipe 2 Boss Agora", Callback = function() equipPerkTeam(dungeonBossPerkTeam, "Boss", false) end })
 
 WheelTab:CreateSection(I.wheel .. " Wheel")
 WheelTab:CreateDropdown({ Name = I.wheel .. " Wheel", Options = { "Auto Detect", "Easter", "Default" }, CurrentOption = { "Auto Detect" }, MultipleOptions = false, Flag = "SelectedWheel", Callback = function(opt) selectedWheelId = opt[1] end })
@@ -1396,7 +2304,7 @@ StatsTab:CreateSection(I.chart .. " Stats")
 StatsTab:CreateButton({
     Name = I.chart .. " Mostrar Stats",
     Callback = function()
-        notify(I.chart .. " Sessao", "Tempo: " .. formatTime(os.clock() - Stats.startedAt) .. " | Boxes: " .. tostring(Stats.boxesBroken) .. " | Crates: " .. tostring(Stats.cratesOpened) .. " | Vendidos: " .. tostring(Stats.itemsSold), 7)
+        notify(I.chart .. " Sessao", "Tempo: " .. formatTime(os.clock() - Stats.startedAt) .. " | Boxes: " .. tostring(Stats.boxesBroken) .. " | Crates: " .. tostring(Stats.cratesOpened) .. " | Vendidos: " .. tostring(Stats.itemsSold) .. " | Index Area: " .. tostring(Stats.indexTargetArea), 7)
     end,
 })
 
@@ -1505,12 +2413,38 @@ task.spawn(function()
         if State.autoDungeon and os.clock() - lastDungeonAction >= autoDungeonDelay then
             lastDungeonAction = os.clock()
 
-            if player:GetAttribute("DungeonId") then
+            local dungeonId = player:GetAttribute("DungeonId")
+            if dungeonId then
+                if tostring(dungeonId) ~= tostring(currentDungeonId) then
+                    currentDungeonId = dungeonId
+                    dungeonVisitedDoors = {}
+                    dungeonCurrentPerkTeamMode = nil
+                    dungeonBossLocked = false
+                    dungeonLastAdvanceDirection = nil
+                    dungeonLastTargetPos = nil
+                    dungeonRoomLockUntil = 0
+                    dungeonFirstTeleportAt = os.clock() + 12
+                    lastDungeonAdvanceAt = os.clock()
+                    updateDungeonPerkTeam(true)
+                else
+                    updateDungeonPerkTeam(false)
+                end
+
                 State.autoAttackBoxes = true
                 pcall(function() RE.ClaimDungeonQuest:FireServer() end)
                 pcall(dungeonMoveAssist)
             else
-                joinDungeonQueue()
+                currentDungeonId = nil
+                dungeonCurrentPerkTeamMode = nil
+                dungeonBossLocked = false
+                dungeonLastAdvanceDirection = nil
+                dungeonLastTargetPos = nil
+                dungeonRoomLockUntil = 0
+                dungeonFirstTeleportAt = 0
+                if lastDungeonJoinAt == 0 or os.clock() - lastDungeonJoinAt >= 10 then
+                    lastDungeonJoinAt = os.clock()
+                    joinDungeonQueue()
+                end
                 task.wait(0.25)
                 skipDungeonQueue()
             end
@@ -1523,6 +2457,29 @@ task.spawn(function()
         if State.webhookEnabled and os.clock() - lastWebhookAt >= webhookDelayMinutes * 60 then
             lastWebhookAt = os.clock()
             sendWebhook(buildWebhookReport(), false)
+        end
+    end
+end)
+
+task.spawn(function()
+    while task.wait(1) do
+        if State.autoCollectTreasure and os.clock() - lastTreasureAt >= 12 then
+            lastTreasureAt = os.clock()
+            collectAllTreasures()
+        end
+
+        if State.autoClaimChest and os.clock() - lastChestAt >= 20 then
+            lastChestAt = os.clock()
+            collectAllChests(true)
+        end
+    end
+end)
+
+task.spawn(function()
+    while task.wait(1) do
+        if State.autoFarmIndex and os.clock() - lastAutoFarmIndexCheck >= autoFarmIndexCheckDelay then
+            lastAutoFarmIndexCheck = os.clock()
+            checkAutoFarmIndex()
         end
     end
 end)
@@ -1588,6 +2545,7 @@ task.spawn(function()
             if State.autoDaily then pcall(function() RE.ClaimLoginReward:FireServer() end) end
             if State.autoAch then pcall(function() RE.ClaimAllAchievements:FireServer() end) end
             if State.autoClaimDamageQuest then claimDamageQuest() end
+            if State.autoBoxPassClaimAll then claimAllBoxPassRewards(true) end
         end
     end
 end)
